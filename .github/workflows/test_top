@@ -1,0 +1,270 @@
+name: Build and deploy Aseprite
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Ежедневно в полночь
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # Ручной запуск
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  check-version:
+    name: Check latest Aseprite release
+    runs-on: ubuntu-latest
+    outputs:
+      download_url: ${{ steps.version_info.outputs.download_url }}
+      latest_tag: ${{ steps.version_info.outputs.latest_tag }}
+      should_build: ${{ steps.should_build.outputs.should_build }}
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get latest version info
+        id: version_info
+        run: |
+          # Получаем последний релиз Aseprite
+          response=$(curl -sL \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/aseprite/aseprite/releases/latest)
+          
+          # Извлекаем информацию
+          latest_tag=$(echo "$response" | jq -r '.tag_name')
+          echo "latest_tag=$latest_tag" >> $GITHUB_OUTPUT
+          echo "Latest tag: $latest_tag"
+          
+          # Находим source download URL
+          download_url=$(echo "$response" | jq -r '.assets[] | select(.name | contains("Source")) | .browser_download_url' | head -1)
+          
+          if [ -z "$download_url" ]; then
+            # Fallback: если не нашли Source, берем первый zip
+            download_url=$(echo "$response" | jq -r '.assets[0].browser_download_url')
+          fi
+          
+          echo "download_url=$download_url" >> $GITHUB_OUTPUT
+          echo "Download URL: $download_url"
+          
+          # Сохраняем tag в файл для кэширования
+          echo "$latest_tag" > latest_tag.txt
+
+      - name: Cache version info
+        id: cache-version
+        uses: actions/cache@v3
+        with:
+          path: latest_tag.txt
+          key: aseprite-version-${{ steps.version_info.outputs.latest_tag }}
+
+      - name: Determine if build is needed
+        id: should_build
+        run: |
+          if [[ "${{ steps.cache-version.outputs.cache-hit }}" != 'true' ]]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "New version detected, will build"
+          else
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "Version already built, skipping"
+          fi
+
+      - name: Create GitHub Release draft
+        if: steps.should_build.outputs.should_build == 'true'
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version_info.outputs.latest_tag }}
+          name: "Aseprite ${{ steps.version_info.outputs.latest_tag }}"
+          draft: true
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-aseprite:
+    name: Build Aseprite
+    needs: check-version
+    if: ${{ needs.check-version.outputs.should_build == 'true' }}
+    runs-on: ${{ matrix.os }}
+    
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+      fail-fast: false
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            libxcursor-dev \
+            libxi-dev \
+            libgl1-mesa-dev \
+            libfontconfig1-dev \
+            libcurl4-openssl-dev \
+            libpng-dev \
+            libjpeg-dev \
+            zlib1g-dev \
+            7zip
+
+      - name: Install system dependencies (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install -y cmake ninja 7zip
+
+      - name: Install system dependencies (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install cmake ninja p7zip
+
+      - name: Download Aseprite source
+        run: |
+          echo "Downloading Aseprite source from: ${{ needs.check-version.outputs.download_url }}"
+          
+          # Создаем рабочие директории
+          mkdir -p aseprite-source aseprite
+          
+          # Скачиваем и распаковываем
+          curl -L "${{ needs.check-version.outputs.download_url }}" -o aseprite-source.zip
+          
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            7z x aseprite-source.zip -oaseprite-source
+          else
+            unzip -q aseprite-source.zip -d aseprite-source
+          fi
+          
+          # Находим и копируем исходники
+          find aseprite-source -name "CMakeLists.txt" -type f | head -1 | xargs dirname | xargs -I {} cp -r {}/* aseprite/ 2>/dev/null || true
+          
+          # Fallback: если не нашли CMakeLists.txt
+          if [ ! -f "aseprite/CMakeLists.txt" ]; then
+            cp -r aseprite-source/*/* aseprite/ 2>/dev/null || cp -r aseprite-source/* aseprite/
+          fi
+          
+          echo "Aseprite source structure:"
+          ls -la aseprite/
+
+      - name: Download Skia
+        run: |
+          # Определяем URL для Skia в зависимости от ОС
+          case "${{ matrix.os }}" in
+            ubuntu-latest)
+              SKIA_URL="https://github.com/aseprite/skia/releases/latest/download/Skia-Linux-Release-x64-libcxx.zip"
+              ;;
+            windows-latest)
+              SKIA_URL="https://github.com/aseprite/skia/releases/latest/download/Skia-Windows-Release-x64-libcxx.zip"
+              ;;
+            macos-latest)
+              SKIA_URL="https://github.com/aseprite/skia/releases/latest/download/Skia-macOS-Release-x64-libcxx.zip"
+              ;;
+          esac
+          
+          echo "Downloading Skia from: $SKIA_URL"
+          mkdir -p skia
+          
+          curl -L "$SKIA_URL" -o skia.zip
+          
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            7z x skia.zip -oskia
+          else
+            unzip -q skia.zip -d skia
+          fi
+          
+          echo "Skia downloaded successfully"
+
+      - name: Cache Skia
+        uses: actions/cache@v3
+        with:
+          path: skia
+          key: skia-${{ matrix.os }}-${{ hashFiles('skia/README.md') }}
+          restore-keys: |
+            skia-${{ matrix.os }}-
+
+      - name: Configure with CMake
+        run: |
+          mkdir -p aseprite/build
+          cd aseprite/build
+          
+          # Базовые параметры CMake
+          CMAKE_ARGS="\
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR=../../skia \
+            -DSKIA_LIBRARY_DIR=../../skia/out/Release-x64 \
+            -G Ninja \
+            .."
+          
+          # OS-specific параметры
+          case "${{ matrix.os }}" in
+            windows-latest)
+              cmake $CMAKE_ARGS
+              ;;
+            macos-latest)
+              cmake $CMAKE_ARGS \
+                -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+              ;;
+            *)
+              cmake $CMAKE_ARGS
+              ;;
+          esac
+          
+          echo "CMake configuration complete"
+
+      - name: Build with Ninja
+        run: |
+          cd aseprite/build
+          ninja -j$(nproc) aseprite
+          
+          echo "Build completed successfully"
+          ls -la bin/
+
+      - name: Create portable package
+        run: |
+          cd aseprite/build/bin
+          
+          # Создаем портативный конфиг файл
+          echo "; Aseprite Portable Configuration" > aseprite.ini
+          echo "[general]" >> aseprite.ini
+          echo "autosave_timer = 300" >> aseprite.ini
+          
+          # Упаковываем в архив
+          case "${{ matrix.os }}" in
+            windows-latest)
+              7z a -tzip "Aseprite-${{ needs.check-version.outputs.latest_tag }}-Windows-x64.zip" *
+              ;;
+            macos-latest)
+              zip -r "Aseprite-${{ needs.check-version.outputs.latest_tag }}-macOS.zip" *
+              ;;
+            *)
+              zip -r "Aseprite-${{ needs.check-version.outputs.latest_tag }}-Linux-x64.zip" *
+              ;;
+          esac
+          
+          echo "Package created:"
+          ls -la *.zip
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aseprite-${{ matrix.os }}-${{ needs.check-version.outputs.latest_tag }}
+          path: aseprite/build/bin/*.zip
+          retention-days: 7
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: aseprite/build/bin/*.zip
+          tag_name: ${{ needs.check-version.outputs.latest_tag }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

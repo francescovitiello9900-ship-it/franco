@@ -1,0 +1,224 @@
+yaml
+name: Build and deploy Aseprite
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Ежедневно в полночь
+  push:
+    branches:
+      - master
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  check-version:
+    name: Check latest Aseprite release
+    runs-on: ubuntu-latest
+    outputs:
+      download_url: ${{ steps.version_info.outputs.download_url }}
+      latest_tag: ${{ steps.version_info.outputs.latest_tag }}
+      should_build: ${{ steps.should_build.outputs.should_build }}
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    steps:
+      - name: Get latest version info
+        id: version_info
+        run: |
+          # Получаем информацию о последнем релизе
+          response=$(curl -sL \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/aseprite/aseprite/releases/latest)
+          
+          # Извлекаем tag_name
+          latest_tag=$(echo "$response" | jq -r '.tag_name')
+          echo "Latest tag: $latest_tag"
+          
+          # Находим URL для скачивания исходного кода (обычно заканчивается на -Source.zip)
+          download_url=$(echo "$response" | jq -r '.assets[] | select(.name | test("-Source.zip$")) | .browser_download_url')
+          
+          if [ -z "$download_url" ]; then
+            echo "Error: Could not find source download URL"
+            exit 1
+          fi
+          
+          echo "Download URL: $download_url"
+          
+          # Сохраняем tag для сравнения
+          echo "$latest_tag" > latest_tag.txt
+          
+          # Устанавливаем outputs
+          echo "::set-output name=latest_tag::$latest_tag"
+          echo "::set-output name=download_url::$download_url"
+          
+      - name: Check if version changed
+        id: check_version
+        run: |
+          # Читаем предыдущую версию из кэша (если есть)
+          if [ -f "cached_tag.txt" ]; then
+            cached_tag=$(cat cached_tag.txt)
+            echo "Cached version: $cached_tag"
+          else
+            cached_tag=""
+            echo "No cached version found"
+          fi
+          
+          current_tag=$(cat latest_tag.txt)
+          echo "Current version: $current_tag"
+          
+          # Проверяем, изменилась ли версия
+          if [ "$cached_tag" != "$current_tag" ]; then
+            echo "Version changed or first run, should build"
+            echo "::set-output name=should_build::true"
+          else
+            echo "Version unchanged, skip build"
+            echo "::set-output name=should_build::false"
+          fi
+          
+      - name: Cache version for next run
+        if: steps.check_version.outputs.should_build == 'true'
+        uses: actions/cache/save@v3
+        with:
+          path: latest_tag.txt
+          key: aseprite-version-${{ steps.version_info.outputs.latest_tag }}
+
+      - name: Create GitHub Release
+        id: create_release
+        if: steps.check_version.outputs.should_build == 'true'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version_info.outputs.latest_tag }}
+          name: "Aseprite ${{ steps.version_info.outputs.latest_tag }}"
+          draft: true
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-aseprite:
+    name: Build Aseprite
+    needs: check-version
+    if: ${{ needs.check-version.outputs.should_build == 'true' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+      fail-fast: false
+    steps:
+      - name: Install build dependencies (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            libxcursor-dev \
+            libxi-dev \
+            libgl1-mesa-dev \
+            libfontconfig1-dev \
+            7zip
+
+      - name: Install build dependencies (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: cmd
+        run: |
+          choco install -y cmake ninja 7zip
+
+      - name: Install build dependencies (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install cmake ninja p7zip
+
+      - name: Download and extract Aseprite source
+        run: |
+          echo "Downloading Aseprite source..."
+          curl -L "${{ needs.check-version.outputs.download_url }}" -o aseprite-source.zip
+          
+          # Создаем директорию и распаковываем
+          mkdir -p aseprite
+          7z x aseprite-source.zip -oaseprite
+          
+          # Переходим в правильную директорию (структура может отличаться)
+          if [ -d "aseprite/aseprite" ]; then
+            mv aseprite/aseprite/* aseprite/
+            rm -rf aseprite/aseprite
+          fi
+          
+          ls -la aseprite/
+
+      - name: Download Skia
+        run: |
+          # Скачиваем Skia для соответствующей ОС
+          SKIA_URL=""
+          case "${{ matrix.os }}" in
+            windows-latest)
+              SKIA_URL="https://github.com/aseprite/skia/releases/download/m102-b858b2a2d6/Skia-Windows-Release-x64-libcxx.zip"
+              ;;
+            ubuntu-latest)
+              SKIA_URL="https://github.com/aseprite/skia/releases/download/m102-b858b2a2d6/Skia-Linux-Release-x64-libcxx.zip"
+              ;;
+            macos-latest)
+              SKIA_URL="https://github.com/aseprite/skia/releases/download/m102-b858b2a2d6/Skia-macOS-Release-x64-libcxx.zip"
+              ;;
+          esac
+          
+          echo "Downloading Skia from: $SKIA_URL"
+          curl -L "$SKIA_URL" -o skia.zip
+          mkdir -p skia
+          7z x skia.zip -oskia
+
+      - name: Configure with CMake
+        run: |
+          mkdir -p aseprite/build
+          cd aseprite/build
+          
+          CMAKE_ARGS="-DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DLAF_BACKEND=skia -DSKIA_DIR=../../skia -DSKIA_LIBRARY_DIR=../../skia/out/Release-x64 -G Ninja"
+          
+          case "${{ matrix.os }}" in
+            windows-latest)
+              cmake $CMAKE_ARGS ..
+              ;;
+            ubuntu-latest)
+              cmake $CMAKE_ARGS ..
+              ;;
+            macos-latest)
+              # Для macOS нужно указать минимальную версию
+              cmake $CMAKE_ARGS \
+                -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+                ..
+              ;;
+          esac
+
+      - name: Build with Ninja
+        run: |
+          cd aseprite/build
+          ninja aseprite
+
+      - name: Prepare package
+        run: |
+          cd aseprite/build
+          
+          case "${{ matrix.os }}" in
+            windows-latest)
+              # Для Windows создаем portable версию
+              echo "; Portable configuration" > bin/aseprite.ini
+              7z a -tzip "Aseprite-${{ needs.check-version.outputs.latest_tag }}-Windows.zip" bin/*
+              ;;
+            ubuntu-latest)
+              # Для Linux можно собрать AppImage или просто архив
+              7z a -tzip "Aseprite-${{ needs.check-version.outputs.latest_tag }}-Linux.zip" bin/*
+              ;;
+            macos-latest)
+              # Для macOS создаем .dmg или .app bundle
+              # Упрощенный вариант - просто zip
+              7z a -tzip "Aseprite-${{ needs.check-version.outputs.latest_tag }}-macOS.zip" bin/*
+              ;;
+          esac
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            aseprite/build/*.zip
+          tag_name: ${{ needs.check-version.outputs.latest_tag }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
